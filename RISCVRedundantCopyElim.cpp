@@ -28,7 +28,7 @@ namespace {
 //    }
 
 
-class RISCVRedundantCopyElim : public MachineFunctionPass {
+    class RISCVRedundantCopyElim : public MachineFunctionPass {
     public:
         static char ID;
         RISCVRedundantCopyElim() : MachineFunctionPass(ID) {}
@@ -72,69 +72,98 @@ class RISCVRedundantCopyElim : public MachineFunctionPass {
         }
     }*/
 
-    //向前传播
-    void RISCVRedundantCopyElim::forwardCopyPropagate(MachineBasicBlock &MBB, bool &Changed) {
-        DenseMap <Register, Register> CopyMap; // %dst -> %src
+    //
+    void RISCVRedundantCopyElim::forwardCopyPropagate(MachineBasicBlock &MBB, bool &Changed){
+        MachineFunction &MF = *MBB.getParent();
+        MachineRegisterInfo &MRI = MF.getRegInfo();
+        const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+        DenseMap<Register,Register> CopyMap; // %dst -> %src
         //替换uses，构建CopyMap
-        for (auto I = MBB.begin(); I != MBB.end(); ++I) {
-            MachineInstr &MI = *I;
+        for(auto I=MBB.begin();I!=MBB.end();++I){
+            MachineInstr &MI=*I;
             //1.替换当前指令中所有use的寄存器
-            for (MachineOperand &Op: MI.operands()) {
-                if (Op.isReg() && Op.isUse() && !Op.isImplicit()) {
-                    Register Reg = Op.getReg();
-                    if (Reg.isVirtual() && CopyMap.count(Reg)) {
-                        Register Root = getRootReg(Reg, CopyMap);
-                        if (Root != Reg) {
-                            Op.setReg(Root);
-                            Changed = true;
-                        }
-                    }
+            for(MachineOperand &Op:MI.operands()){
+                if (!Op.isReg() || !Op.isUse() || Op.isImplicit())
+                    continue;
+                Register Reg=Op.getReg();
+                //跳过物理寄存器
+                if (!Reg.isVirtual() || !CopyMap.count(Reg))
+                    continue;
+                //跳过调试指令中的寄存器
+                if (MI.isDebugValue())
+                    continue;
+                Register Root= getRootReg(Reg,CopyMap);
+                if(Root==Reg) continue;
+
+                //兼容子寄存器,如果支持子寄存器索引，跳过
+                unsigned  SubIndex=Op.getSubReg();
+                if(SubIndex!=0 && !TRI->getSubReg(Root,SubIndex)){
+                    continue;
                 }
+
+                Op.setReg(Root);
+                //更新调试信息
+//                MRI.updateDbgUsersToReg(Reg,Root,DbgUsers);
+                Changed=true;
             }
             //2.处理Copy指令
-            if (MI.isCopy()) {
-                Register Dst = MI.getOperand(0).getReg();
-                Register Src = MI.getOperand(1).getReg();
-                if (Dst.isVirtual() && Src.isVirtual()) {
-                    Register RootSrc = getRootReg(Src, CopyMap);
+            if(MI.isCopy()){
+                Register Dst=MI.getOperand(0).getReg();
+                Register Src=MI.getOperand(1).getReg();
+                if(Dst.isVirtual() && Src.isVirtual()){
+                    Register RootSrc= getRootReg(Src, CopyMap);
                     // 冗余 COPY: %a = COPY %a → 删除
-                    if (Dst == RootSrc) {
+                    if(Dst==RootSrc){
                         MI.eraseFromParent();
-                        Changed = true;
+                        Changed=true;
                         continue;
                     }
-                    CopyMap[Dst] = RootSrc;
+                    CopyMap[Dst]=RootSrc;
                 }
                 continue;
             }
-            //3.当前指令定义了寄存器--失效相关copy映射
-            for (const MachineOperand &Op: MI.operands()) {
-                if (Op.isReg() && Op.isDef() && !Op.isImplicit()) {
-                    Register DefReg = Op.getReg();
-                    if (DefReg.isVirtual()) {
-                        // 存在对DefReg的定义，会使COPY映射失效
-                        CopyMap.erase(DefReg);
-                        // 可以遍历COPYMap删除value==DefReg的项
+
+            //3.处理受影响的映射
+            SmallVector<Register, 4> KeysToErase;
+            // 当前指令定义了寄存器--失效相关copy映射
+            for (const MachineOperand &Op : MI.operands()) {
+                if (!Op.isReg() || !Op.isDef() || Op.isImplicit())
+                    continue;
+
+                Register DefReg = Op.getReg();
+                if (!DefReg.isVirtual())
+                    continue;
+                // 存在对DefReg的定义，会使COPY映射失效
+                CopyMap.erase(DefReg);
+                // 遍历COPYMap删除value==DefReg的项
+                for(auto &KV:CopyMap){
+                    if(KV.second==DefReg){
+                        KeysToErase.push_back(KV.first);
                     }
                 }
             }
+            //批量删除定义影响的
+            for(Register Key:KeysToErase){
+                CopyMap.erase(Key);
+            }
+
         }
 
 
         //删除无用的COPY
-        MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
-        for (auto I = MBB.begin(); I != MBB.end();) {
-            MachineInstr &MI = *I;
-            if (MI.isCopy()) {
-                Register DefReg = MI.getOperand(0).getReg();
-                if (DefReg.isVirtual() && MRI.use_nodbg_empty(DefReg)) {
-                    I = MBB.erase(I);
-                    Changed = true;
+        for(auto I=MBB.begin();I!=MBB.end();){
+            MachineInstr &MI=*I;
+            if(MI.isCopy()){
+                Register DefReg=MI.getOperand(0).getReg();
+                if(DefReg.isVirtual() && MRI.use_nodbg_empty(DefReg)){
+                    I=MBB.erase(I);
+                    Changed=true;
                     continue;
                 }
             }
             ++I;
         }
+
     }
 
 

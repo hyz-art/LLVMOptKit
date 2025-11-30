@@ -1,35 +1,50 @@
-# test/test-copy-fixed.mir
 # RUN: llc -march=riscv32 -O2 -riscv-enable-copy-propagation=true %s -o - | FileCheck %s
 
 --- |
-  define i32 @test_redundant_copy(i32 %a, i32 %b) {
+  define i32 @test_full_copy_prop(i32 %a, i32 %b) {
   entry:
-    %sum = add i32 %a, %b
-    ret i32 %sum
+    %t1 = add i32 %a, %b
+    %t2 = add i32 %t1, %a
+    ret i32 %t2
   }
 ...
 ---
-name:            test_redundant_copy
+name:            test_full_copy_prop
 tracksRegLiveness: true
 liveins:
-  - { reg: '$x10' }   # 只声明物理寄存器活跃，不绑定虚拟寄存器
+  - { reg: '$x10' }
   - { reg: '$x11' }
 body: |
   bb.0.entry:
     liveins: $x10, $x11
 
-    ; 显式定义 %0 和 %1 —— 这是它们的“def”
-    %0:gpr = COPY $x10
-    %1:gpr = COPY $x11
+    ; --- 基础 COPY 链（应被穿透并删除） ---
+    %0:gpr = COPY $x10          ; arg a
+    %1:gpr = COPY $x11          ; arg b
+    %2:gpr = COPY %0            ; redundant
+    %3:gpr = COPY %2            ; redundant
+    %4:gpr = COPY %3            ; redundant
 
-    ; 冗余复制链（用于测试 copy propagation）
-    %2:gpr = COPY %0
-    %3:gpr = COPY %2
-    %4:gpr = COPY %3
+    ; --- 使用穿透后的值 ---
+    %5:gpr = ADD %4, %1         ; → should become ADD %0, %1
 
-    %5:gpr = ADD %4, %1
+    ; --- 覆盖测试：%0 被重新定义，%2 不应再指向旧 %0 ---
+    %0:gpr = ADD %5, %5         ; ← redefine %0! old value dead.
+    %6:gpr = COPY %2            ; %2 still holds old %0 → must NOT become %0!
+    %7:gpr = ADD %6, %6         ; → keep %6, not replace with %0
 
-    $x10 = COPY %5
+    ; --- 物理寄存器保护：不能优化涉及 $x10/$sp 的 COPY ---
+    %8:gpr = COPY $x10          ; ← physical src → skip optimization
+    $x10 = COPY %5              ; ← physical dst → skip
+
+    ; --- 调试信息：确保 DBG_VALUE 被正确更新 ---
+    DBG_VALUE $noreg, $noreg, !"a", !DIExpression(), debug-location !1
+    DBG_VALUE %2, $noreg, !"old_a", !DIExpression(), debug-location !1  ; %2 used in debug
+
     PseudoRET implicit $x10
+
 ...
-s
+--- debug-info
+!1 = !DILocation(line: 1, column: 1, scope: !2)
+!2 = !DISubprogram(name: "test_full_copy_prop", ...)
+...
