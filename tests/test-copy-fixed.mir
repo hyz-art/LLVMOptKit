@@ -1,0 +1,35 @@
+# test/test-copy-fixed.mir
+# RUN: llc -march=riscv32 -O2 -riscv-enable-copy-propagation=true %s -o - | FileCheck %s
+
+--- |
+  define i32 @test_redundant_copy(i32 %a, i32 %b) {
+  entry:
+    %sum = add i32 %a, %b
+    ret i32 %sum
+  }
+...
+---
+name:            test_redundant_copy
+tracksRegLiveness: true
+liveins:
+  - { reg: '$x10' }   # 只声明物理寄存器活跃，不绑定虚拟寄存器
+  - { reg: '$x11' }
+body: |
+  bb.0.entry:
+    liveins: $x10, $x11
+
+    ; 显式定义 %0 和 %1 —— 这是它们的“def”
+    %0:gpr = COPY $x10
+    %1:gpr = COPY $x11
+
+    ; 冗余复制链（用于测试 copy propagation）
+    %2:gpr = COPY %0
+    %3:gpr = COPY %2
+    %4:gpr = COPY %3
+
+    %5:gpr = ADD %4, %1
+
+    $x10 = COPY %5
+    PseudoRET implicit $x10
+...
+s
